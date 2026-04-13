@@ -1,4 +1,31 @@
-- name: Run SeatGeek scraper
+name: VKT Multi-Platform Scraper
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: scrapers/package.json
+
+      - name: Install dependencies
+        run: cd scrapers && npm install
+
+      - name: Run SeatGeek scraper
         run: cd scrapers && node seatgeek.js
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -13,3 +40,6 @@
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
         continue-on-error: true
+
+      - name: Summary
+        run: echo "Scrape complete at $(date)"
