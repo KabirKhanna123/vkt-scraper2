@@ -1,4 +1,4 @@
-// VKT SeatGeek Scraper — No API key required
+// VKT SeatGeek Scraper — Fixed search
 import { createClient } from '@supabase/supabase-js';
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -13,7 +13,7 @@ function safeNum(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
 
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-  'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+  'Accept': 'application/json',
   'Accept-Language': 'en-US,en;q=0.9',
   'Referer': 'https://seatgeek.com/'
 };
@@ -35,24 +35,93 @@ async function scrapedRecently(eventId) {
   return data && data.length > 0;
 }
 
-async function searchSeatGeek(eventName, eventDate) {
+async function searchSeatGeekAPI(query, eventDate) {
   try {
-    const query = eventName.replace(/tickets\s*[-–]\s*/i,'').replace(/\s+at\s+.*/i,'').trim().slice(0,60);
-    const res = await fetch(`https://seatgeek.com/search?q=${encodeURIComponent(query)}`, { headers: HEADERS });
+    // Use SeatGeek's internal search API directly — returns clean JSON
+    const dateObj = new Date(eventDate + 'T12:00:00');
+    const dateFrom = new Date(dateObj.getTime() - 86400000).toISOString().slice(0,10);
+    const dateTo = new Date(dateObj.getTime() + 86400000).toISOString().slice(0,10);
+
+    const params = new URLSearchParams({
+      q: query,
+      per_page: '5',
+      'datetime_local.gte': dateFrom,
+      'datetime_local.lte': dateTo
+    });
+
+    const res = await fetch(`https://seatgeek.com/api/search?${params}`, { headers: HEADERS });
+    if (!res.ok) return null;
+    const text = await res.text();
+    if (text.trim().startsWith('<')) return null;
+    const data = JSON.parse(text);
+    const events = data.events || data.results || [];
+    return events.length ? events[0] : null;
+  } catch(e) { return null; }
+}
+
+async function searchSeatGeekPage(query, eventDate) {
+  try {
+    const res = await fetch(
+      `https://seatgeek.com/search?q=${encodeURIComponent(query)}`,
+      { headers: { ...HEADERS, Accept: 'text/html,*/*' } }
+    );
     if (!res.ok) return null;
     const html = await res.text();
-    const match = html.match(/<script id="__NEXT_DATA__"[^>]*>(\{[\s\S]*?\})<\/script>/);
+
+    // Try multiple __NEXT_DATA__ paths
+    const match = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
     if (!match) return null;
+
     const json = JSON.parse(match[1]);
-    const events = json?.props?.pageProps?.events || json?.props?.pageProps?.initialData?.events || [];
+    const pp = json?.props?.pageProps;
+
+    const events =
+      pp?.events ||
+      pp?.initialData?.events ||
+      pp?.data?.events ||
+      pp?.searchResults?.events ||
+      pp?.results?.events ||
+      [];
+
     if (!events.length) return null;
+
     const eventDateObj = new Date(eventDate + 'T12:00:00');
     for (const e of events) {
       const eDate = new Date(e.datetime_local || e.date || '');
       if (!isNaN(eDate) && Math.abs(eDate - eventDateObj) < 86400000 * 2) return e;
     }
     return events[0];
-  } catch(e) { console.error('SeatGeek search error:', e.message); return null; }
+  } catch(e) { return null; }
+}
+
+async function searchSeatGeek(eventName, eventDate) {
+  // Clean query — keep team names intact, just remove junk
+  const query = eventName
+    .replace(/\s*[-–]\s*world cup.*/i, '')
+    .replace(/tickets\s*[-–]\s*/i, '')
+    .replace(/\s*\(match \d+\).*/i, '')
+    .replace(/\s*group [a-z].*/i, '')
+    .trim()
+    .slice(0, 80);
+
+  // Try API first
+  let result = await searchSeatGeekAPI(query, eventDate);
+  if (result) return result;
+
+  await sleep(400);
+
+  // Fallback to page scrape
+  result = await searchSeatGeekPage(query, eventDate);
+  if (result) return result;
+
+  // Try shorter query (first 2 words)
+  const shortQuery = query.split(' ').slice(0, 3).join(' ');
+  if (shortQuery !== query) {
+    await sleep(400);
+    result = await searchSeatGeekAPI(shortQuery, eventDate);
+  }
+
+  return result;
 }
 
 async function postSnapshot(payload) {
@@ -66,7 +135,7 @@ async function postSnapshot(payload) {
 }
 
 async function run() {
-  console.log('VKT SeatGeek Scraper (no-API mode) starting...');
+  console.log('VKT SeatGeek Scraper starting...');
   const events = await getEvents();
   console.log(`Found ${events.length} events to process`);
   let scraped = 0, skipped = 0, failed = 0;
@@ -74,6 +143,7 @@ async function run() {
   for (const event of events) {
     if (await scrapedRecently(event.id)) { skipped++; continue; }
     await sleep(DELAY_MS);
+
     const sgEvent = await searchSeatGeek(event.name, event.date);
     if (!sgEvent) { console.log(`  Not found: ${event.name}`); failed++; continue; }
 
