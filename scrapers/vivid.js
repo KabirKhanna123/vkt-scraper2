@@ -1,10 +1,10 @@
-// VKT VividSeats Scraper — No API key required
+// VKT VividSeats Scraper — Fixed endpoint
 import { createClient } from '@supabase/supabase-js';
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const RECENT_HOURS = 20;
-const DELAY_MS = 1200;
+const DELAY_MS = 1500;
 const EVENT_LIMIT = 150;
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -13,9 +13,10 @@ function safeNum(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
 
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-  'Accept': 'application/json, text/html, */*',
+  'Accept': 'application/json',
   'Accept-Language': 'en-US,en;q=0.9',
-  'Referer': 'https://www.vividseats.com/'
+  'Referer': 'https://www.vividseats.com/',
+  'x-requested-with': 'XMLHttpRequest'
 };
 
 async function getEvents() {
@@ -38,39 +39,56 @@ async function scrapedRecently(eventId) {
 async function searchVividSeats(eventName, eventDate) {
   try {
     const query = eventName.replace(/tickets\s*[-–]\s*/i,'').replace(/\s+at\s+.*/i,'').trim().slice(0,60);
+
+    // Use VividSeats catalog search API
     const res = await fetch(
-      `https://www.vividseats.com/hermes/api/v1/productions?query=${encodeURIComponent(query)}&rows=5`,
+      `https://www.vividseats.com/api/1.0/catalog/productions?headlinerId=&keyword=${encodeURIComponent(query)}&rows=5`,
       { headers: HEADERS }
     );
+
     if (!res.ok) return null;
-    const data = await res.json();
-    const productions = data.productions || data.results || data;
-    if (!Array.isArray(productions) || !productions.length) return null;
+    const text = await res.text();
+
+    // Check if we got HTML instead of JSON
+    if (text.trim().startsWith('<')) return null;
+
+    const data = JSON.parse(text);
+    const productions = data.productions || data.results || (Array.isArray(data) ? data : []);
+    if (!productions.length) return null;
+
     const eventDateObj = new Date(eventDate + 'T12:00:00');
     for (const p of productions) {
-      const pDate = new Date(p.localDate || p.date || p.eventDate || '');
+      const pDate = new Date(p.localDate || p.date || p.eventDate || p.productionDate || '');
       if (!isNaN(pDate) && Math.abs(pDate - eventDateObj) < 86400000 * 2) return p;
     }
     return productions[0];
-  } catch(e) { console.error('VividSeats search error:', e.message); return null; }
+  } catch(e) {
+    console.error('VividSeats search error:', e.message);
+    return null;
+  }
 }
 
 async function getVividListings(productionId) {
   try {
     const res = await fetch(
-      `https://www.vividseats.com/hermes/api/v1/listings?productionId=${productionId}&rows=100&sortBy=price&sortDirection=asc`,
+      `https://www.vividseats.com/api/1.0/productions/${productionId}/listings?rows=100&sortBy=PRICE&sortDirection=ASC`,
       { headers: HEADERS }
     );
     if (!res.ok) return null;
-    const data = await res.json();
-    return data.listings || data.results || data;
-  } catch(e) { console.error('VividSeats listings error:', e.message); return null; }
+    const text = await res.text();
+    if (text.trim().startsWith('<')) return null;
+    const data = JSON.parse(text);
+    return data.listings || data.ticketListings || (Array.isArray(data) ? data : null);
+  } catch(e) {
+    console.error('VividSeats listings error:', e.message);
+    return null;
+  }
 }
 
 function extractPrices(listings) {
   if (!listings || !Array.isArray(listings)) return [];
   return listings
-    .map(l => safeNum(l.price || l.pricePerTicket || l.ticketPrice || l.listingPrice || l.salePrice || 0))
+    .map(l => safeNum(l.price || l.pricePerTicket || l.ticketPrice || l.listingPrice || l.amount || 0))
     .filter(p => p > 1 && p < 25000)
     .sort((a, b) => a - b);
 }
@@ -94,13 +112,14 @@ async function run() {
   for (const event of events) {
     if (await scrapedRecently(event.id)) { skipped++; continue; }
     await sleep(DELAY_MS);
+
     const vsEvent = await searchVividSeats(event.name, event.date);
     if (!vsEvent) { console.log(`  Not found: ${event.name}`); failed++; continue; }
 
     const productionId = vsEvent.id || vsEvent.productionId;
     if (!productionId) { failed++; continue; }
 
-    await sleep(500);
+    await sleep(600);
     const listings = await getVividListings(productionId);
     const prices = extractPrices(listings);
 
